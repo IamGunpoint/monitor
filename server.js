@@ -3,7 +3,7 @@ const fetch = require('node-fetch');
 const http = require('http');
 require('dotenv').config();
 
-// --- Render Compatibility (Health Check) ---
+// 1. WEB SERVER FOR RENDER (Keep-Alive)
 http.createServer((req, res) => {
     res.write("Bot is running!");
     res.end();
@@ -13,141 +13,182 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] 
 });
 
+// In-memory Database
 let monitors = []; 
 
-// --- Monitoring Logic with DM Notifications ---
+// 2. MONITORING LOGIC (Every 15 Seconds)
 setInterval(async () => {
     for (const mon of monitors) {
         try {
-            const res = await fetch(mon.url);
+            const res = await fetch(mon.url, { timeout: 5000 });
             const isNowOnline = res.ok;
             const newStatus = isNowOnline ? '✅ Online' : '❌ Offline';
 
-            // Check for status change to notify user
+            // DM User on Status Change
             if (mon.status !== '⏳ Checking...' && mon.status !== newStatus) {
-                await notifyUser(mon, newStatus);
+                try {
+                    const user = await client.users.fetch(mon.userId);
+                    const alertEmbed = new EmbedBuilder()
+                        .setTitle('🚨 Status Alert')
+                        .setColor(isNowOnline ? 0x00FF00 : 0xFF0000)
+                        .addFields(
+                            { name: 'Site', value: `\`${mon.url}\`` },
+                            { name: 'New Status', value: newStatus }
+                        )
+                        .setTimestamp();
+                    await user.send({ embeds: [alertEmbed] });
+                } catch (e) { console.log("DM blocked by user."); }
             }
-
             mon.status = newStatus;
         } catch (err) {
-            if (mon.status !== '❌ Offline' && mon.status !== '⏳ Checking...') {
-                await notifyUser(mon, '❌ Offline');
-            }
             mon.status = '❌ Offline';
         }
     }
 }, 15000);
 
-async function notifyUser(monitor, newStatus) {
-    try {
-        const user = await client.users.fetch(monitor.userId);
-        const embed = new EmbedBuilder()
-            .setTitle('🚨 Monitor Alert')
-            .setDescription(`Your website status has changed!`)
-            .addFields(
-                { name: 'URL', value: `\`${monitor.url}\`` },
-                { name: 'New Status', value: `**${newStatus}**` }
-            )
-            .setColor(newStatus.includes('✅') ? 0x00FF00 : 0xFF0000)
-            .setTimestamp();
-
-        await user.send({ embeds: [embed] });
-    } catch (err) {
-        console.log(`Could not DM user ${monitor.userId}. They might have DMs off.`);
-    }
-}
-
-// --- Interaction Handling ---
+// 3. COMMAND REGISTRATION & READY
 client.once('ready', async () => {
-    console.log(`🚀 ${client.user.tag} is online!`);
+    console.log(`🚀 Logged in as ${client.user.tag}`);
     
     const commands = [
-        new SlashCommandBuilder().setName('create').setDescription('Add a new URL to monitor')
-            .addStringOption(opt => opt.setName('url').setDescription('The website URL').setRequired(true)),
-        new SlashCommandBuilder().setName('list').setDescription('List your active monitors'),
-        new SlashCommandBuilder().setName('delete').setDescription('Remove a monitor')
-            .addStringOption(opt => opt.setName('id').setDescription('The Monitor ID').setRequired(true)),
-        new SlashCommandBuilder().setName('help').setDescription('Show bot commands'),
-        new SlashCommandBuilder().setName('admin-list').setDescription('List all (Admin)')
+        new SlashCommandBuilder()
+            .setName('create')
+            .setDescription('Add a new URL to monitor')
+            .addStringOption(option => 
+                option.setName('url')
+                    .setDescription('The full URL (e.g., https://google.com)')
+                    .setRequired(true)),
+        
+        new SlashCommandBuilder()
+            .setName('list')
+            .setDescription('List your active monitors'),
+        
+        new SlashCommandBuilder()
+            .setName('delete')
+            .setDescription('Remove a monitor')
+            .addStringOption(option => 
+                option.setName('id')
+                    .setDescription('The Monitor ID from /list')
+                    .setRequired(true)),
+
+        new SlashCommandBuilder().setName('help').setDescription('Show all commands'),
+
+        // Admin Commands
+        new SlashCommandBuilder()
+            .setName('admin-list')
+            .setDescription('Admin: View all global monitors')
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-        new SlashCommandBuilder().setName('admin-clear').setDescription('Clear all (Admin)')
+        
+        new SlashCommandBuilder()
+            .setName('admin-clear')
+            .setDescription('Admin: Delete ALL monitors')
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+        new SlashCommandBuilder()
+            .setName('admin-remove')
+            .setDescription('Admin: Force remove a monitor by ID')
+            .addStringOption(option => option.setName('id').setDescription('Monitor ID').setRequired(true))
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     ];
 
-    await client.application.commands.set(commands);
+    try {
+        await client.application.commands.set(commands);
+        console.log("✅ All commands registered successfully!");
+    } catch (error) {
+        console.error("❌ Error registering commands:", error);
+    }
 });
 
+// 4. INTERACTION HANDLER
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    if (interaction.commandName === 'create') {
-        const url = interaction.options.getString('url');
-        const userMonitors = monitors.filter(m => m.userId === interaction.user.id);
+    const { commandName, options, user } = interaction;
 
-        if (userMonitors.length >= 3) {
-            return interaction.reply({ content: '⚠️ Limit reached (3 monitors max).', ephemeral: true });
+    if (commandName === 'create') {
+        const url = options.getString('url');
+        const userCount = monitors.filter(m => m.userId === user.id).length;
+
+        if (userCount >= 3) {
+            return interaction.reply({ content: '🚫 Limit reached! You can only have 3 monitors.', ephemeral: true });
         }
 
-        const newMon = { 
-            id: Math.random().toString(36).substr(2, 9), 
-            userId: interaction.user.id, 
-            url, 
-            status: '⏳ Checking...' 
+        const newMon = {
+            id: Math.floor(1000 + Math.random() * 9000).toString(), // Simple 4-digit ID
+            userId: user.id,
+            url: url,
+            status: '⏳ Checking...'
         };
-        
+
         monitors.push(newMon);
-        await interaction.reply({ 
-            embeds: [new EmbedBuilder().setTitle('✅ Created').setDescription(`Monitoring **${url}**`).setColor(0x00FF00)] 
-        });
+        const embed = new EmbedBuilder()
+            .setTitle('✅ Monitor Created')
+            .setDescription(`Started monitoring **${url}** every 15 seconds.`)
+            .setColor(0x00FF00);
+        
+        return interaction.reply({ embeds: [embed] });
     }
 
-    if (interaction.commandName === 'list') {
-        const myMons = monitors.filter(m => m.userId === interaction.user.id);
-        if (myMons.length === 0) return interaction.reply('No active monitors.');
+    if (commandName === 'list') {
+        const myMons = monitors.filter(m => m.userId === user.id);
+        if (myMons.length === 0) return interaction.reply('❌ You have no active monitors.');
 
         const embed = new EmbedBuilder()
-            .setTitle('📂 Your Monitors')
-            .setColor(0x5865F2)
+            .setTitle('📊 Your Monitors')
+            .setColor(0x00AAFF)
             .addFields(myMons.map(m => ({
-                name: `ID: ${m.id}`,
-                value: `Status: ${m.status}`
+                name: `🆔 ID: ${m.id}`,
+                value: `**Status:** ${m.status}\n**URL:** \`[PROTECTED]\``,
+                inline: true
             })));
 
-        await interaction.reply({ embeds: [embed] });
+        return interaction.reply({ embeds: [embed] });
     }
 
-    if (interaction.commandName === 'delete') {
-        const id = interaction.options.getString('id');
-        const initialLen = monitors.length;
-        monitors = monitors.filter(m => !(m.id === id && m.userId === interaction.user.id));
+    if (commandName === 'delete') {
+        const id = options.getString('id');
+        const found = monitors.find(m => m.id === id && m.userId === user.id);
 
-        if (monitors.length === initialLen) return interaction.reply('❌ ID not found.');
-        await interaction.reply('🗑️ Monitor removed.');
+        if (!found) return interaction.reply({ content: '❌ Invalid ID or you do not own this monitor.', ephemeral: true });
+
+        monitors = monitors.filter(m => m.id !== id);
+        return interaction.reply(`🗑️ Monitor \`${id}\` has been deleted.`);
     }
 
-    if (interaction.commandName === 'admin-list') {
-        if (monitors.length === 0) return interaction.reply('Zero active monitors.');
-        const embed = new EmbedBuilder()
-            .setTitle('🛡️ Admin: Global List')
-            .addFields(monitors.map(m => ({ name: m.url, value: `User: <@${m.userId}>` })));
-        await interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (interaction.commandName === 'admin-clear') {
-        monitors = [];
-        await interaction.reply('🧹 Database cleared.');
-    }
-
-    if (interaction.commandName === 'help') {
+    if (commandName === 'help') {
         const helpEmbed = new EmbedBuilder()
-            .setTitle('🤖 Monitor Bot Help')
+            .setTitle('🤖 Web Monitor Help')
             .setColor(0xFFFF00)
             .addFields(
-                { name: '/create [url]', value: 'Starts monitoring a site' },
-                { name: '/list', value: 'Shows your monitors & status' },
-                { name: '/delete [id]', value: 'Stops a specific monitor' }
-            );
-        await interaction.reply({ embeds: [helpEmbed] });
+                { name: 'User Commands', value: '`/create [url]` - Add monitor\n`/list` - Show your sites\n`/delete [id]` - Remove site' },
+                { name: 'Admin Commands', value: '`/admin-list` - Show everything\n`/admin-remove [id]` - Delete any\n`/admin-clear` - Reset all' }
+            )
+            .setFooter({ text: 'Interval: 15 Seconds' });
+        return interaction.reply({ embeds: [helpEmbed] });
+    }
+
+    // --- ADMIN LOGIC ---
+    if (commandName === 'admin-list') {
+        if (monitors.length === 0) return interaction.reply('Database empty.');
+        const embed = new EmbedBuilder()
+            .setTitle('🛡️ Admin: Global List')
+            .setColor(0xFF0000)
+            .addFields(monitors.map(m => ({
+                name: `ID: ${m.id} | User: ${m.userId}`,
+                value: `URL: ${m.url} | Status: ${m.status}`
+            })));
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    if (commandName === 'admin-remove') {
+        const id = options.getString('id');
+        monitors = monitors.filter(m => m.id !== id);
+        return interaction.reply({ content: `🛡️ Admin force-removed \`${id}\`.`, ephemeral: true });
+    }
+
+    if (commandName === 'admin-clear') {
+        monitors = [];
+        return interaction.reply({ content: '🧹 Database wiped.', ephemeral: true });
     }
 });
 
